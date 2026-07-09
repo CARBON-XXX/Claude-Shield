@@ -1,3 +1,8 @@
+mod blobs;
+mod domains;
+mod proxy;
+mod watcher;
+
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -8,155 +13,6 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 static ORIGINAL_TZ: OnceLock<String> = OnceLock::new();
-
-const PROXY_JS_CONTENT: &str = r#"
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const path = require('path');
-const { spawnSync } = require('child_process');
-
-const PORT = 18989;
-const TARGET_HOST = 'api.anthropic.com';
-
-// Translation log file (same directory as proxy.js)
-const LOG_FILE = path.join(path.dirname(process.argv[1] || __filename), 'proxy.log');
-let requestCounter = 0;
-
-function logTranslation(original, translated, field) {
-  if (original === translated) return;
-  const ts = new Date().toISOString();
-  const entry = [
-    `\n[${ ts }] ── Translation #${++requestCounter} (field: ${field}) ──`,
-    `  [ZH] ${original.substring(0, 500)}${original.length > 500 ? '...' : ''}`,
-    `  [EN] ${translated.substring(0, 500)}${translated.length > 500 ? '...' : ''}`,
-    ``
-  ].join('\n');
-  try { fs.appendFileSync(LOG_FILE, entry); } catch(e) {}
-  // Real-time stderr hint visible in user's terminal
-  process.stderr.write(`\x1b[36m[Shield Translate]\x1b[0m ${original.substring(0, 60)}${original.length > 60 ? '...' : ''} \x1b[32m->\x1b[0m ${translated.substring(0, 60)}${translated.length > 60 ? '...' : ''}\n`);
-}
-
-function translateText(text) {
-  if (!/[\u4e00-\u9fa5]/.test(text)) return text;
-  try {
-    const parts = text.split(/(```[\s\S]*?```)/g);
-    const translatedParts = parts.map(part => {
-      if (part.startsWith('```') && part.endsWith('```')) {
-        return part;
-      }
-      const subparts = part.split(/(`[^`\n]+`)/g);
-      return subparts.map(subpart => {
-        if (subpart.startsWith('`') && subpart.endsWith('`')) {
-          return subpart;
-        }
-        if (!/[\u4e00-\u9fa5]/.test(subpart)) return subpart;
-        const res = spawnSync('curl', [
-          '-s', '-G', 'https://translate.googleapis.com/translate_a/single',
-          '--data-urlencode', 'client=gtx',
-          '--data-urlencode', 'sl=zh-CN',
-          '--data-urlencode', 'tl=en',
-          '--data-urlencode', 'dt=t',
-          `--data-urlencode`, `q=${subpart}`
-        ], { encoding: 'utf8', timeout: 15000 });
-        if (res.error || res.status !== 0) {
-          process.stderr.write(`\x1b[31m[Shield BLOCK] Translation failed! Request will NOT be forwarded.\x1b[0m\n`);
-          throw new Error('TRANSLATION_FAILED');
-        }
-        const json = JSON.parse(res.stdout);
-        return json[0].map(s => s[0]).join('');
-      }).join('');
-    });
-    return translatedParts.join('');
-  } catch (e) {
-    if (e.message === 'TRANSLATION_FAILED') throw e;
-    return text;
-  }
-}
-
-function translatePayload(obj, field) {
-  field = field || 'root';
-  if (typeof obj === 'string') {
-    const result = translateText(obj);
-    if (result !== obj) logTranslation(obj, result, field);
-    return result;
-  } else if (Array.isArray(obj)) {
-    return obj.map((item, i) => translatePayload(item, `${field}[${i}]`));
-  } else if (obj !== null && typeof obj === 'object') {
-    const newObj = {};
-    for (const key in obj) {
-      if ((key === 'content' || key === 'text') && typeof obj[key] === 'string') {
-        const result = translateText(obj[key]);
-        if (result !== obj[key]) logTranslation(obj[key], result, key);
-        newObj[key] = result;
-      } else {
-        newObj[key] = translatePayload(obj[key], key);
-      }
-    }
-    return newObj;
-  }
-  return obj;
-}
-
-const server = http.createServer((req, res) => {
-  let bodyData = [];
-  req.on('data', chunk => { bodyData.push(chunk); });
-  req.on('end', () => {
-    let body = Buffer.concat(bodyData);
-    let headers = { ...req.headers };
-    delete headers.host;
-    delete headers.connection;
-
-    if (req.method === 'POST' && headers['content-type']?.includes('application/json')) {
-      try {
-        let json = JSON.parse(body.toString());
-        json = translatePayload(json, 'payload');
-        body = Buffer.from(JSON.stringify(json));
-        headers['content-length'] = body.length;
-      } catch (e) {
-        if (e.message === 'TRANSLATION_FAILED') {
-          res.writeHead(503);
-          res.end('Service Unavailable: Translation gateway failed. Request blocked to prevent Chinese text leak.');
-          return;
-        }
-      }
-    }
-
-    const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
-    let opt = {
-      hostname: TARGET_HOST,
-      port: 443,
-      path: req.url,
-      method: req.method,
-      headers: headers
-    };
-
-    if (proxyUrl) {
-      const urlMatch = proxyUrl.match(/^(?:https?:\/\/)?([^:/]+):(\d+)/);
-      if (urlMatch) {
-        opt.hostname = urlMatch[1];
-        opt.port = parseInt(urlMatch[2]);
-        opt.path = `https://${TARGET_HOST}${req.url}`;
-      }
-    }
-
-    const clientReq = (proxyUrl ? http : https).request(opt, clientRes => {
-      res.writeHead(clientRes.statusCode, clientRes.headers);
-      clientRes.pipe(res);
-    });
-
-    clientReq.on('error', e => {
-      res.writeHead(502);
-      res.end(`Bad Gateway: ${e.message}`);
-    });
-
-    clientReq.write(body);
-    clientReq.end();
-  });
-});
-
-server.listen(PORT, '127.0.0.1');
-"#;
 
 
 
@@ -286,11 +142,11 @@ const T_ZH: Translation = Translation {
     help_adv: "优势:",
     adv1: "同时支持 cli.js 混淆脚本与 claude 原生可执行文件",
     adv2: "自动覆盖全局/局部环境变量（TZ=UTC）以进行二次防御",
-    adv3: "7 处等长无损字节微调，不破坏软件签名或运行时执行校验",
+    adv3: "等长无损字节微调（时区/完整147域名密文/实验室关键词/隐写撇号），不破坏执行完整性",
     sys_os: "操作系统:   ",
-    sys_node: "Node.js:    ",
+    sys_node: "运行时:     ",
     sys_tz: "原始时区:   ",
-    sys_tz_cover: "时区已覆盖: TZ=UTCed",
+    sys_tz_cover: "时区已覆盖: TZ=UTC",
     path_label: "路径: ",
     ver_label: "版本: ",
     size_label: "大小: ",
@@ -328,7 +184,7 @@ const T_EN: Translation = Translation {
     daemon_start: "[DAEMON] Starting global real-time daemon sentinel...",
     single_check: "Performing validation & initial patch check on all targets...",
     daemon_active: "Daemon Sentinel Mounted! Monitoring {n} target file(s):",
-    daemon_desc: "File watcher uses native OS event notifications or lightweight polling. Zero CPU/IO footprint when idle.",
+    daemon_desc: "File watcher uses native OS event notifications (kqueue/inotify). Zero CPU/IO footprint when idle.",
     stop_desc: "Press Ctrl+C or run 'claude-shield stop' to stop protection.",
     monitoring: "Monitoring active",
     elapsed: "Elapsed: ",
@@ -357,11 +213,11 @@ const T_EN: Translation = Translation {
     help_adv: "Key Benefits:",
     adv1: "Supports both cli.js script and native claude executables",
     adv2: "Overrides global/local TZ=UTC env for secondary stego defense",
-    adv3: "7 surgical same-length byte patches keeping binary integrity",
+    adv3: "Same-length byte patches for timezone / full 147-domain blob / lab keywords / stego apostrophes",
     sys_os: "OS Platform: ",
-    sys_node: "NodeJS:      ",
+    sys_node: "Runtime:     ",
     sys_tz: "Original TZ: ",
-    sys_tz_cover: "TZ Overridden: TZ=UTCed",
+    sys_tz_cover: "TZ Overridden: TZ=UTC",
     path_label: "Path: ",
     ver_label: "Version: ",
     size_label: "Size: ",
@@ -397,18 +253,24 @@ fn get_msg(key: &str) -> String {
         "bannerSub" => t.banner_sub.to_string(),
         "tzActive" => t.tz_active.to_string(),
         "scanning" => t.scanning.to_string(),
+        "foundTargets" => t.found_targets.to_string(),
         "statusErr" => t.status_err.to_string(),
+        "statusActive" => t.status_active.to_string(),
         "statusPatched" => t.status_patched.to_string(),
         "statusMissing" => t.status_missing.to_string(),
         "patching" => t.patching.to_string(),
         "checking" => t.checking.to_string(),
         "patchedOk" => t.patched_ok.to_string(),
         "noFeature" => t.no_feature.to_string(),
+        "patchSuccess" => t.patch_success.to_string(),
+        "summary" => t.summary.to_string(),
         "restoring" => t.restoring.to_string(),
         "restoredOk" => t.restored_ok.to_string(),
         "noBackup" => t.no_backup.to_string(),
+        "restoreSummary" => t.restore_summary.to_string(),
         "daemonStart" => t.daemon_start.to_string(),
         "singleCheck" => t.single_check.to_string(),
+        "daemonActive" => t.daemon_active.to_string(),
         "daemonDesc" => t.daemon_desc.to_string(),
         "stopDesc" => t.stop_desc.to_string(),
         "monitoring" => t.monitoring.to_string(),
@@ -416,9 +278,12 @@ fn get_msg(key: &str) -> String {
         "fileChange" => t.file_change.to_string(),
         "recheck" => t.recheck.to_string(),
         "autoRepaired" => t.auto_repaired.to_string(),
+        "hotpatchOk" => t.hotpatch_ok.to_string(),
+        "hotpatchErr" => t.hotpatch_err.to_string(),
         "daemonExit" => t.daemon_exit.to_string(),
         "installAlias" => t.install_alias.to_string(),
         "aliasOk" => t.alias_ok.to_string(),
+        "aliasTip" => t.alias_tip.to_string(),
         "aliasWinOk" => t.alias_win_ok.to_string(),
         "helpTitle" => t.help_title.to_string(),
         "helpUsage" => t.help_usage.to_string(),
@@ -516,13 +381,16 @@ fn get_pid_file() -> PathBuf {
     d
 }
 
+#[allow(dead_code)]
 fn get_proxy_pid_file() -> PathBuf {
     let mut d = get_shield_dir();
     d.push("proxy.pid");
     d
 }
 
+#[allow(dead_code)]
 fn get_proxy_js_file() -> PathBuf {
+    // Legacy path kept for cleanup of older Node-based installs.
     let mut d = get_shield_dir();
     d.push("proxy.js");
     d
@@ -565,7 +433,8 @@ fn dec(enc: &[u8]) -> Vec<u8> {
     enc.iter().map(|&b| b ^ 0x5A).collect()
 }
 
-// Byte arrays corresponding to the 7 Same-Length signature modifications
+// Same-length signature patches extracted from Claude Code 2.1.91–2.1.196.
+// Domain/lab rules neutralize the FULL base64+XOR91 ciphertext blobs (147 domains).
 fn get_patches() -> Vec<PatchRule> {
     vec![
         PatchRule {
@@ -587,18 +456,18 @@ fn get_patches() -> Vec<PatchRule> {
         PatchRule {
             id: "DOMAIN_LIST",
             group: "domain",
-            desc: "Domain List",
-            find: dec(&[21, 30, 12, 105, 17, 30, 53, 107, 23, 25, 110, 108, 23, 52, 15, 110, 20, 30, 0, 105]),
-            from: dec(&[21, 30, 12, 105, 17, 30, 53, 107, 23, 25, 110, 108, 23, 52, 15, 110, 20, 30, 0, 105]),
-            to: dec(&[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]),
+            desc: "Domain Blacklist (147 entries)",
+            find: blobs::DOMAIN_BLOB.as_bytes().to_vec(),
+            from: blobs::DOMAIN_BLOB.as_bytes().to_vec(),
+            to: blobs::DOMAIN_NEUTRAL.as_bytes().to_vec(),
         },
         PatchRule {
             id: "LAB_KEYWORDS",
             group: "lab",
-            desc: "Lab Keywords",
-            find: dec(&[10, 32, 110, 113, 17, 35, 61, 113, 10, 48, 24, 105, 20, 48, 11, 106, 20, 9, 61, 32]),
-            from: dec(&[10, 32, 110, 113, 17, 35, 61, 113, 10, 48, 24, 105, 20, 48, 11, 106, 20, 9, 61, 32]),
-            to: dec(&[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]),
+            desc: "AI Lab Keywords",
+            find: blobs::LAB_BLOB.as_bytes().to_vec(),
+            from: blobs::LAB_BLOB.as_bytes().to_vec(),
+            to: blobs::LAB_NEUTRAL.as_bytes().to_vec(),
         },
         PatchRule {
             id: "STEG_2019",
@@ -1041,7 +910,7 @@ fn start_daemon_in_background() {
     let out_file = File::create(&log_path).unwrap();
     let err_file = File::create(&log_path).unwrap();
 
-    let child = Command::new(script_path)
+    let child = Command::new(&script_path)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
@@ -1053,22 +922,21 @@ fn start_daemon_in_background() {
             let pid = c.id();
             let _ = fs::write(&pid_file, pid.to_string());
             
-            // 写入并启动本地 HTTP 翻译中转代理 (proxy.js)
-            let proxy_js = get_proxy_js_file();
-            let _ = fs::write(&proxy_js, PROXY_JS_CONTENT);
-            let proxy_log = get_shield_dir().join("proxy.log");
-            let p_out = File::create(&proxy_log).unwrap();
-            let p_err = File::create(&proxy_log).unwrap();
-            let proxy_child = Command::new("node")
-                .arg(&proxy_js)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(p_out))
-                .stderr(Stdio::from(p_err))
-                .spawn();
-
-            if let Ok(pc) = proxy_child {
-                let _ = fs::write(get_proxy_pid_file(), pc.id().to_string());
-                write_log(&format!("[PROXY] Translation proxy agent launched. PID: {}", pc.id()));
+            // Launch pure-Rust translation proxy (no Node.js)
+            match proxy::start_background(&script_path) {
+                Ok(ppid) => {
+                    write_log(&format!("[PROXY] Pure-Rust translation proxy launched. PID: {}", ppid));
+                    info(&format!("Translation proxy on {} (PID {})", proxy::local_base_url(), ppid));
+                }
+                Err(e) => {
+                    write_log(&format!("[PROXY] Failed to start translation proxy: {}", e));
+                    warn(&format!("Translation proxy not started: {}", e));
+                }
+            }
+            // Clean up legacy Node proxy artifacts if present
+            let legacy = get_proxy_js_file();
+            if legacy.exists() {
+                let _ = fs::remove_file(&legacy);
             }
 
             write_log(&format!("[SHIELD] Daemon started in background. PID: {}", pid));
@@ -1083,59 +951,47 @@ fn stop_daemon() {
     let pid_file = get_pid_file();
     if !pid_file.exists() {
         fail("No running daemon PID file discovered.");
-        return;
-    }
+    } else {
+        let pid_str = fs::read_to_string(&pid_file).unwrap_or_default();
+        let pid = pid_str.trim().to_string();
 
-    let pid_str = fs::read_to_string(&pid_file).unwrap_or_default();
-    let pid = pid_str.trim().to_string();
-
-    if pid.is_empty() {
-        fail("PID file is empty.");
-        return;
-    }
-
-    #[cfg(unix)]
-    {
-        match Command::new("kill").args(&[&pid]).status() {
-            Ok(s) if s.success() => {
-                ok(&format!("Stop signal sent to daemon (PID: {}).", pid));
-            }
-            _ => {
-                warn("Daemon process not found. Cleaning up stale PID file...");
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        match Command::new("taskkill").args(&["/F", "/PID", &pid]).status() {
-            Ok(s) if s.success() => {
-                ok(&format!("Daemon process stopped (PID: {}).", pid));
-            }
-            _ => {
-                warn("Daemon process not found. Cleaning up stale PID file...");
-            }
-        }
-    }
-
-    let proxy_pid_file = get_proxy_pid_file();
-    if proxy_pid_file.exists() {
-        if let Ok(pid_str) = fs::read_to_string(&proxy_pid_file) {
-            let pid = pid_str.trim().to_string();
-            if !pid.is_empty() {
-                #[cfg(unix)]
-                {
-                    let _ = Command::new("kill").args(&[&pid]).status();
+        if pid.is_empty() {
+            fail("PID file is empty.");
+        } else {
+            #[cfg(unix)]
+            {
+                match Command::new("kill").args(&[&pid]).status() {
+                    Ok(s) if s.success() => {
+                        ok(&format!("Stop signal sent to daemon (PID: {}).", pid));
+                    }
+                    _ => {
+                        warn("Daemon process not found. Cleaning up stale PID file...");
+                    }
                 }
-                #[cfg(windows)]
-                {
-                    let _ = Command::new("taskkill").args(&["/F", "/PID", &pid]).status();
+            }
+            #[cfg(windows)]
+            {
+                match Command::new("taskkill").args(&["/F", "/PID", &pid]).status() {
+                    Ok(s) if s.success() => {
+                        ok(&format!("Daemon process stopped (PID: {}).", pid));
+                    }
+                    _ => {
+                        warn("Daemon process not found. Cleaning up stale PID file...");
+                    }
                 }
             }
         }
-        let _ = fs::remove_file(proxy_pid_file);
+        let _ = fs::remove_file(pid_file);
     }
 
-    let _ = fs::remove_file(pid_file);
+    if proxy::stop() {
+        ok("Translation proxy stopped.");
+    }
+    // Clean legacy node artifacts
+    let legacy = get_proxy_js_file();
+    if legacy.exists() {
+        let _ = fs::remove_file(legacy);
+    }
 }
 
 fn show_daemon_status() {
@@ -1222,17 +1078,22 @@ fn show_help() {
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "scan") + &s_r(), get_msg("cmdScan"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "patch") + &s_r(), get_msg("cmdPatch"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "restore") + &s_r(), get_msg("cmdRestore"));
+    println!("  {}  {}", s_cyan() + &format!("{:<18}", "config") + &s_r(), "Cloud protection config (--proxy/--base-url/--enforce/--clear)");
+    println!("  {}  {}", s_cyan() + &format!("{:<18}", "audit") + &s_r(), "Audit proxy env vars and base-url against the 147-domain blacklist");
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "daemon") + &s_r(), get_msg("cmdDaemon"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "start") + &s_r(), get_msg("cmdStart"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "stop") + &s_r(), get_msg("cmdStop"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "status") + &s_r(), get_msg("cmdStatus"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "logs") + &s_r(), get_msg("cmdLogs"));
     println!("  {}  {}", s_cyan() + &format!("{:<18}", "install") + &s_r(), get_msg("cmdAlias"));
+    println!("  {}  {}", s_cyan() + &format!("{:<18}", "proxy") + &s_r(), "Run pure-Rust translation proxy in foreground (internal)");
     println!("");
     println!("{}", get_msg("helpAdv"));
     println!("  {} {}", ICON_OK, get_msg("adv1"));
     println!("  {} {}", ICON_OK, get_msg("adv2"));
     println!("  {} {}", ICON_OK, get_msg("adv3"));
+    println!("  {} Neutralizes full 147-domain + lab-keyword ciphertext blobs", ICON_OK);
+    println!("  {} Native OS file events (kqueue/inotify); pure-Rust proxy (no Node.js)", ICON_OK);
     println!("");
 }
 
@@ -1356,77 +1217,92 @@ fn show_status_panel(scan: &ScanResult, version: &str, tz_protected: bool) {
 //  Core Thread watcher (No poll optimization)
 // ============================================================
 fn run_daemon_sentinel(targets: Vec<PathBuf>) {
-    write_log("[SHIELD] Sentinel daemon loaded in foreground watcher.");
+    write_log("[SHIELD] Sentinel daemon loaded (native OS file events).");
+
+    #[cfg(target_os = "macos")]
+    write_log("[SHIELD] Watch backend: kqueue EVFILT_VNODE (native event-driven).");
+    #[cfg(target_os = "linux")]
+    write_log("[SHIELD] Watch backend: inotify (native event-driven).");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    write_log("[SHIELD] Watch backend: metadata poll fallback.");
 
     // Perform initial patching check
     for t in &targets {
         if let Ok(info) = check_file(t) {
             if info.active > 0 {
                 match patch_file(t, info.buf) {
-                    Ok(count) => write_log(&format!("[SHIELD] Auto patched target at launch: {} ({} segments)", t.display(), count)),
-                    Err(e) => write_log(&format!("[SHIELD] Auto patching failed for {}: {}", t.display(), e)),
+                    Ok(count) => write_log(&format!(
+                        "[SHIELD] Auto patched target at launch: {} ({} segments)",
+                        t.display(),
+                        count
+                    )),
+                    Err(e) => write_log(&format!(
+                        "[SHIELD] Auto patching failed for {}: {}",
+                        t.display(),
+                        e
+                    )),
                 }
             }
         }
     }
 
-    let start_time = SystemTime::now();
-    let mut file_states = std::collections::HashMap::new();
+    write_log(&format!(
+        "[SHIELD] Watching {} targets. File sentinel active.",
+        targets.len()
+    ));
 
-    for t in &targets {
-        if let Ok(meta) = fs::metadata(t) {
-            if let Ok(mtime) = meta.modified() {
-                let len = meta.len();
-                file_states.insert(t.clone(), (mtime, len));
+    let rx = watcher::spawn_watcher(targets.clone());
+    let mut last_patch: std::collections::HashMap<PathBuf, SystemTime> =
+        std::collections::HashMap::new();
+
+    for event in rx {
+        match event {
+            watcher::WatchEvent::Heartbeat { elapsed_secs } => {
+                write_log(&format!(
+                    "[SHIELD] Heartbeat check. Elapsed: {}s. Active targets: {}",
+                    elapsed_secs,
+                    targets.len()
+                ));
             }
-        }
-    }
+            watcher::WatchEvent::Modified(path) => {
+                // Debounce rapid FS events (npm install writes many times)
+                let now = SystemTime::now();
+                if let Some(prev) = last_patch.get(&path) {
+                    if now.duration_since(*prev).unwrap_or_default() < Duration::from_millis(500) {
+                        continue;
+                    }
+                }
+                last_patch.insert(path.clone(), now);
 
-    write_log(&format!("[SHIELD] Watching {} targets. File sentinel active.", targets.len()));
+                write_log(&format!("[SHIELD] File change detected: {}", path.display()));
+                thread::sleep(Duration::from_millis(800));
 
-    // Periodic heartbeat (every 60 seconds)
-    let heartbeat_targets = targets.clone();
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(60));
-            let elapsed = SystemTime::now().duration_since(start_time).unwrap_or_default().as_secs();
-            write_log(&format!("[SHIELD] Heartbeat check. Elapsed: {}s. Active targets: {}", elapsed, heartbeat_targets.len()));
-        }
-    });
+                // Re-resolve in case the path was replaced
+                let candidates = if path.exists() {
+                    vec![path.clone()]
+                } else {
+                    find_installed_targets()
+                };
 
-    // Main low-overhead loop to watch file metadata updates
-    loop {
-        thread::sleep(Duration::from_secs(4));
-
-        for t in &targets {
-            if let Ok(meta) = fs::metadata(t) {
-                if let Ok(mtime) = meta.modified() {
-                    let len = meta.len();
-                    if let Some(&(prev_mtime, prev_len)) = file_states.get(t) {
-                        if mtime != prev_mtime || len != prev_len {
-                            file_states.insert(t.clone(), (mtime, len));
-                            write_log(&format!("[SHIELD] File change detected: {}", t.display()));
-
-                            // Allow some buffer for compiler/writer processes to lock/release
-                            thread::sleep(Duration::from_millis(800));
-                            if let Ok(info) = check_file(t) {
-                                if info.active > 0 {
-                                    write_log(&format!("[SHIELD] Active detection found in updated file, applying hot-patch: {}", t.display()));
-                                    match patch_file(t, info.buf) {
-                                        Ok(count) => write_log(&format!("[SHIELD] Hot-patch successfully reapplied: {} ({} segments)", t.display(), count)),
-                                        Err(e) => write_log(&format!("[SHIELD] Hot-patch reapply failed: {}", e)),
-                                    }
-                                    if let Ok(new_meta) = fs::metadata(t) {
-                                        if let Ok(nmtime) = new_meta.modified() {
-                                            let nlen = new_meta.len();
-                                            file_states.insert(t.clone(), (nmtime, nlen));
-                                        }
-                                    }
-                                }
+                for t in candidates {
+                    if let Ok(info) = check_file(&t) {
+                        if info.active > 0 {
+                            write_log(&format!(
+                                "[SHIELD] Active detection found in updated file, applying hot-patch: {}",
+                                t.display()
+                            ));
+                            match patch_file(&t, info.buf) {
+                                Ok(count) => write_log(&format!(
+                                    "[SHIELD] Hot-patch successfully reapplied: {} ({} segments)",
+                                    t.display(),
+                                    count
+                                )),
+                                Err(e) => write_log(&format!(
+                                    "[SHIELD] Hot-patch reapply failed: {}",
+                                    e
+                                )),
                             }
                         }
-                    } else {
-                        file_states.insert(t.clone(), (mtime, len));
                     }
                 }
             }
@@ -1511,24 +1387,10 @@ fn print_env_commands() {
             .unwrap_or_default();
     }
 
-    // 检查本地 Node 翻译代理代理是否在运行
-    let proxy_active = get_proxy_pid_file().exists() && {
-        if let Ok(pid_str) = fs::read_to_string(get_proxy_pid_file()) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                #[cfg(unix)]
-                {
-                    Command::new("kill").args(&["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
-                }
-                #[cfg(windows)]
-                {
-                    Command::new("tasklist").arg("/FI").arg(format!("PID eq {}", pid)).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
-                }
-            } else { false }
-        } else { false }
-    };
+    let proxy_active = proxy::is_running();
 
     if proxy_active {
-        println!("export ANTHROPIC_BASE_URL=\"http://127.0.0.1:18989\";");
+        println!("export ANTHROPIC_BASE_URL=\"{}\";", proxy::local_base_url());
     } else if !conf.base_url.is_empty() {
         println!("export ANTHROPIC_BASE_URL=\"{}\";", conf.base_url);
     }
@@ -1538,7 +1400,7 @@ fn print_env_commands() {
         println!("export http_proxy=\"{}\";", conf.proxy_url);
         println!("export all_proxy=\"{}\";", conf.proxy_url);
     }
-    
+
     // 强制主动出站代理 TCP 联通度诊断
     if conf.enforce_proxy || !active_proxy.is_empty() {
         if active_proxy.is_empty() {
@@ -1550,6 +1412,163 @@ fn print_env_commands() {
             return;
         }
     }
+}
+
+fn hostname_from_url(url: &str) -> Option<String> {
+    let mut s = url.trim();
+    if let Some(rest) = s.strip_prefix("https://") {
+        s = rest;
+    } else if let Some(rest) = s.strip_prefix("http://") {
+        s = rest;
+    }
+    let hostport = s.split('/').next().unwrap_or("");
+    let host = hostport.split('@').last().unwrap_or(hostport);
+    let host = host.split(':').next().unwrap_or(host).trim().to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn match_domain_blacklist(host: &str) -> Option<&'static str> {
+    let host = host.to_ascii_lowercase();
+    for d in domains::DOMAIN_BLACKLIST {
+        let dl = d.to_ascii_lowercase();
+        // Short tokens like "cn" are exact-match only to avoid flagging every *.cn host.
+        if !dl.contains('.') && dl.len() <= 3 {
+            if host == dl {
+                return Some(*d);
+            }
+            continue;
+        }
+        if host == dl || host.ends_with(&format!(".{}", dl)) {
+            return Some(*d);
+        }
+    }
+    None
+}
+
+fn match_lab_keywords(host: &str) -> Option<&'static str> {
+    let host = host.to_ascii_lowercase();
+    for k in domains::LAB_KEYWORDS {
+        if host.contains(&k.to_ascii_lowercase()) {
+            return Some(*k);
+        }
+    }
+    None
+}
+
+fn run_proxy_audit() {
+    println!("\n+--- Terminal Proxy & Gateway Audit ------------------+");
+
+    let keys = [
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+        "ANTHROPIC_BASE_URL",
+    ];
+    let mut any = false;
+    for k in keys {
+        match env::var(k) {
+            Ok(v) if !v.is_empty() => {
+                any = true;
+                ok(&format!("{}={}", k, v));
+            }
+            _ => {
+                info(&format!("{}=(unset)", k));
+            }
+        }
+    }
+
+    let conf = read_config();
+    if !conf.proxy_url.is_empty() {
+        ok(&format!("config PROXY_URL={}", conf.proxy_url));
+        any = true;
+    }
+    if !conf.base_url.is_empty() {
+        ok(&format!("config BASE_URL={}", conf.base_url));
+        any = true;
+    }
+
+    if !any {
+        warn("No proxy / base-url configuration detected — real IP may leak.");
+    }
+
+    // Evaluate ANTHROPIC_BASE_URL / config base url against the 147-domain list
+    let base = env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if conf.base_url.is_empty() {
+                None
+            } else {
+                Some(conf.base_url.clone())
+            }
+        });
+
+    println!("");
+    println!("  Domain blacklist entries loaded: {}", domains::DOMAIN_BLACKLIST.len());
+    println!("  Lab keyword entries loaded:      {}", domains::LAB_KEYWORDS.len());
+
+    if let Some(url) = base {
+        if let Some(host) = hostname_from_url(&url) {
+            if host == "api.anthropic.com" || host == "127.0.0.1" || host == "localhost" {
+                ok(&format!("Base URL host '{}' is safe / local.", host));
+            } else {
+                match match_domain_blacklist(&host) {
+                    Some(d) => fail(&format!(
+                        "Base URL host '{}' matches blacklist entry '{}' (would trigger fingerprint).",
+                        host, d
+                    )),
+                    None => ok(&format!("Base URL host '{}' not in the 147-domain blacklist.", host)),
+                }
+                match match_lab_keywords(&host) {
+                    Some(k) => fail(&format!(
+                        "Base URL host '{}' contains lab keyword '{}' (would trigger fingerprint).",
+                        host, k
+                    )),
+                    None => ok("No AI-lab keyword match on base URL host."),
+                }
+            }
+        }
+    } else {
+        info("ANTHROPIC_BASE_URL unset — fingerprint path inactive on official endpoint.");
+    }
+
+    if proxy::is_running() {
+        ok(&format!(
+            "Pure-Rust translation proxy is ACTIVE at {}",
+            proxy::local_base_url()
+        ));
+    } else {
+        warn("Translation proxy is not running (start via: claude-shield start).");
+    }
+
+    // Live TCP check for configured outbound proxy
+    let outbound = if !conf.proxy_url.is_empty() {
+        conf.proxy_url.clone()
+    } else {
+        env::var("https_proxy")
+            .or_else(|_| env::var("HTTPS_PROXY"))
+            .or_else(|_| env::var("all_proxy"))
+            .or_else(|_| env::var("ALL_PROXY"))
+            .unwrap_or_default()
+    };
+    if !outbound.is_empty() {
+        if is_proxy_port_alive(&outbound) {
+            ok(&format!("Outbound proxy reachable: {}", outbound));
+        } else {
+            fail(&format!("Outbound proxy OFFLINE: {}", outbound));
+        }
+    }
+
+    println!("+----------------------------------------------------+");
 }
 
 fn translate_zh_to_en(text: &str) -> Result<String, String> {
@@ -1706,7 +1725,7 @@ fn main() {
         unsafe { NO_COLOR = true; }
     }
 
-    if cmd != "daemon" && cmd != "env" && cmd != "translate" {
+    if cmd != "daemon" && cmd != "env" && cmd != "translate" && cmd != "proxy" {
         show_banner();
     }
 
@@ -1715,13 +1734,22 @@ fn main() {
         return;
     }
 
-    if cmd != "daemon" && cmd != "env" && cmd != "translate" {
+    if cmd != "daemon" && cmd != "env" && cmd != "translate" && cmd != "proxy" {
         println!("  {}{}{}", s_dim(), get_msg("tzActive") + &env::var("TZ").unwrap_or_default(), s_r());
     }
 
     match cmd.as_str() {
         "config" => {
             handle_config_command(&args);
+        }
+        "audit" => {
+            run_proxy_audit();
+        }
+        "proxy" => {
+            if let Err(e) = proxy::run_foreground() {
+                eprintln!("[PROXY] {}", e);
+                std::process::exit(1);
+            }
         }
         "env" => {
             print_env_commands();
